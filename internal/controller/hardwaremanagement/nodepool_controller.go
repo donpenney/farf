@@ -58,9 +58,12 @@ func requeueWithCustomInterval(interval time.Duration) ctrl.Result {
 	return ctrl.Result{RequeueAfter: interval}
 }
 
-//+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodepools,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodepools,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodepools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodepools/finalizers,verbs=update
+//+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodes,verbs=get;create;list;watch;update;patch;delete
+//+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodes/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodes/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -80,6 +83,7 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 	if err = r.Client.Get(ctx, req.NamespacedName, object); err != nil {
 		if errors.IsNotFound(err) {
 			// The NodePool could have been deleted
+			r.Logger.ErrorContext(ctx, "NodePool not found... deleted? "+req.Name)
 			err = nil
 			return
 		}
@@ -99,7 +103,6 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		// Uncomment the following line adding a pointer to an instance of the controlled resource as an argument
-		// For().
+		For(&hwmgmtv1alpha1.NodePool{}).
 		Complete(r)
 }
