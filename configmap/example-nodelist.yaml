@@ -1,0 +1,24 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: nodelist
+  namespace: oran-hwmgr-plugin-generic
+data:
+  hwprofiles: |
+    profiles:
+      - name: profile-spr-single-processor-64G
+        nodes:
+          - dummy-sp-64g-0
+          - dummy-sp-64g-1
+          - dummy-sp-64g-2
+          - dummy-sp-64g-3
+          - dummy-sp-64g-4
+      - name: profile-spr-dual-processor-128G
+        nodes:
+          - dummy-dp-128g-0
+          - dummy-dp-128g-1
+          - dummy-dp-128g-2
+          - dummy-dp-128g-3
+          - dummy-dp-128g-4
+          - dummy-dp-128g-5
+          - dummy-dp-128g-6
