@@ -3,7 +3,6 @@ package utils
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"reflect"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,7 +16,7 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-var utilsLog = ctrl.Log.WithName("oranUtilsLog")
+var utilsLog = ctrl.Log.WithName("utilsLog")
 
 // Resource operations
 const (
@@ -27,12 +26,14 @@ const (
 
 func UpdateK8sCRStatus(ctx context.Context, c client.Client, object client.Object) error {
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		err := c.Status().Update(ctx, object)
-		return err
+		if err := c.Status().Update(ctx, object); err != nil {
+			return fmt.Errorf("failed to update status: %w", err)
+		}
+		return nil
 	})
 
 	if err != nil {
-		return err
+		return fmt.Errorf("status update failed after retries: %w", err)
 	}
 
 	return nil
@@ -40,22 +41,21 @@ func UpdateK8sCRStatus(ctx context.Context, c client.Client, object client.Objec
 
 // CreateK8sCR creates/updates/patches an object.
 func CreateK8sCR(ctx context.Context, c client.Client,
-	logger *slog.Logger,
 	newObject client.Object, ownerObject client.Object,
 	operation string) (err error) {
 
 	// Get the name and namespace of the object:
 	key := client.ObjectKeyFromObject(newObject)
-	logger.Info("[CreateK8sCR] Resource", "name", key.Name)
+	utilsLog.Info("[CreateK8sCR] Resource", "name", key.Name)
 
 	// We can set the owner reference only for objects that live in the same namespace, as cross
 	// namespace owners are forbidden. This also applies to non-namespaced objects like cluster
-	// roles or cluster role bindings; those have empty namespaces so the equals comparison
+	// roles or cluster role bindings; those have empty namespaces, so the equals comparison
 	// should also work.
 	if ownerObject != nil && ownerObject.GetNamespace() == key.Namespace {
 		err = controllerutil.SetControllerReference(ownerObject, newObject, c.Scheme())
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to set controller reference: %w", err)
 		}
 	}
 
@@ -73,41 +73,46 @@ func CreateK8sCR(ctx context.Context, c client.Client,
 	err = c.Get(ctx, key, oldObject)
 
 	// If there was an error obtaining the CR and the error was "Not found", create the object.
-	// If any other other occurred, return the error.
+	// If any other occurred, return the error.
 	// If the CR already exists, patch it or update it.
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info(
+			utilsLog.Info(
 				"[CreateK8sCR] CR not found, CREATE it",
 				"name", newObject.GetName(),
 				"namespace", newObject.GetNamespace())
 			err = c.Create(ctx, newObject)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to create CR %s/%s: %w", newObject.GetNamespace(), newObject.GetName(), err)
 			}
 		} else {
-			return err
+			return fmt.Errorf("failed to get CR %s/%s: %w", newObject.GetNamespace(), newObject.GetName(), err)
 		}
 	} else {
 		newObject.SetResourceVersion(oldObject.GetResourceVersion())
 		if operation == PATCH {
-			logger.Info("[CreateK8sCR] CR already present, PATCH it",
+			utilsLog.Info("[CreateK8sCR] CR already present, PATCH it",
 				"name", newObject.GetName(),
 				"namespace", newObject.GetNamespace())
-			return c.Patch(ctx, newObject, client.MergeFrom(oldObject))
+			if err := c.Patch(ctx, newObject, client.MergeFrom(oldObject)); err != nil {
+				return fmt.Errorf("failed to patch object %s/%s: %w", newObject.GetNamespace(), newObject.GetName(), err)
+			}
+			return nil
 		} else if operation == UPDATE {
-			logger.Info("[CreateK8sCR] CR already present, UPDATE it",
+			utilsLog.Info("[CreateK8sCR] CR already present, UPDATE it",
 				"name", newObject.GetName(),
 				"namespace", newObject.GetNamespace())
-			return c.Update(ctx, newObject)
+			if err := c.Update(ctx, newObject); err != nil {
+				return fmt.Errorf("failed to update object %s/%s: %w", newObject.GetNamespace(), newObject.GetName(), err)
+			}
+			return nil
 		}
 	}
 
 	return nil
 }
 
-func DoesK8SResourceExist(ctx context.Context, c client.Client,
-	name, namespace string, obj client.Object) (resourceExists bool, err error) {
+func DoesK8SResourceExist(ctx context.Context, c client.Client, name, namespace string, obj client.Object) (resourceExists bool, err error) {
 	err = c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, obj)
 
 	if err != nil {
@@ -116,7 +121,7 @@ func DoesK8SResourceExist(ctx context.Context, c client.Client,
 				"name", name, "namespace", namespace)
 			return false, nil
 		} else {
-			return false, err
+			return false, fmt.Errorf("failed to check existence of resource '%s' in namespace '%s': %w", name, namespace, err)
 		}
 	} else {
 		utilsLog.Info("[doesK8SResourceExist] Resource already present, return. ",

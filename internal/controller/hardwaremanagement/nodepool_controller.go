@@ -43,28 +43,28 @@ type NodePoolReconciler struct {
 	hwmgr  *service.HwMgrService
 }
 
-func doNotRequeue() ctrl.Result {
+func doNotRequeue() ctrl.Result { // nolint:unused
 	return ctrl.Result{Requeue: false}
 }
 
-func requeueWithError(err error) (ctrl.Result, error) {
+func requeueWithError(err error) (ctrl.Result, error) { // nolint:unused
 	// can not be fixed by user during reconcile
 	return ctrl.Result{}, err
 }
 
-func requeueWithLongInterval() ctrl.Result {
+func requeueWithLongInterval() ctrl.Result { // nolint:unused
 	return requeueWithCustomInterval(5 * time.Minute)
 }
 
-func requeueWithMediumInterval() ctrl.Result {
+func requeueWithMediumInterval() ctrl.Result { // nolint:unused
 	return requeueWithCustomInterval(1 * time.Minute)
 }
 
-func requeueWithShortInterval() ctrl.Result {
+func requeueWithShortInterval() ctrl.Result { // nolint:unused
 	return requeueWithCustomInterval(15 * time.Second)
 }
 
-func requeueWithCustomInterval(interval time.Duration) ctrl.Result {
+func requeueWithCustomInterval(interval time.Duration) ctrl.Result { // nolint:unused
 	return ctrl.Result{RequeueAfter: interval}
 }
 
@@ -235,7 +235,11 @@ func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.hwmgr = hwmgr
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&hwmgmtv1alpha1.NodePool{}).
-		Complete(r)
+		Complete(r); err != nil {
+		return fmt.Errorf("failed to create controller: %w", err)
+	}
+
+	return nil
 }
