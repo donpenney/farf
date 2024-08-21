@@ -18,15 +18,20 @@ package hardwaremanagement
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/openshift-kni/generic-plugin/internal/controller/utils"
+	"github.com/openshift-kni/generic-plugin/internal/service"
 	hwmgmtv1alpha1 "github.com/openshift-kni/oran-o2ims/api/hardwaremanagement/v1alpha1"
 )
 
@@ -35,6 +40,7 @@ type NodePoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Logger *slog.Logger
+	hwmgr  *service.HwMgrService
 }
 
 func doNotRequeue() ctrl.Result {
@@ -52,6 +58,10 @@ func requeueWithLongInterval() ctrl.Result {
 
 func requeueWithMediumInterval() ctrl.Result {
 	return requeueWithCustomInterval(1 * time.Minute)
+}
+
+func requeueWithShortInterval() ctrl.Result {
+	return requeueWithCustomInterval(15 * time.Second)
 }
 
 func requeueWithCustomInterval(interval time.Duration) ctrl.Result {
@@ -78,9 +88,9 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 	_ = log.FromContext(ctx)
 	result = doNotRequeue()
 
-	// Fetch the object:
-	object := &hwmgmtv1alpha1.NodePool{}
-	if err = r.Client.Get(ctx, req.NamespacedName, object); err != nil {
+	// Fetch the nodepool:
+	nodepool := &hwmgmtv1alpha1.NodePool{}
+	if err = r.Client.Get(ctx, req.NamespacedName, nodepool); err != nil {
 		if errors.IsNotFound(err) {
 			// The NodePool could have been deleted
 			r.Logger.ErrorContext(ctx, "NodePool not found... deleted? "+req.Name)
@@ -95,13 +105,130 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 		return
 	}
 
-	r.Logger.InfoContext(ctx, "[NodePool] "+object.Name)
+	r.Logger.InfoContext(ctx, "[NodePool] "+nodepool.Name)
 
-	return ctrl.Result{}, nil
+	return r.handleNodePoolObject(ctx, nodepool)
+}
+
+type NodePoolFSMAction int
+
+const (
+	NodePoolFSMCreate = iota
+	NodePoolFSMProcessing
+	NodePoolFSMNoop
+)
+
+func (r *NodePoolReconciler) determineAction(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) NodePoolFSMAction {
+	if len(nodepool.Status.Conditions) == 0 {
+		r.Logger.InfoContext(ctx, "Handling Create NodePool request, name="+nodepool.Name)
+		return NodePoolFSMCreate
+	}
+
+	failedCondition := meta.FindStatusCondition(
+		nodepool.Status.Conditions,
+		string(utils.NodePoolConditionTypes.Failed))
+	if failedCondition != nil && failedCondition.Status == metav1.ConditionTrue {
+		r.Logger.InfoContext(ctx, "NodePool request in Failed state, name="+nodepool.Name)
+		return NodePoolFSMNoop
+	}
+
+	provisionedCondition := meta.FindStatusCondition(
+		nodepool.Status.Conditions,
+		string(utils.NodePoolConditionTypes.Provisioned))
+	if provisionedCondition != nil && provisionedCondition.Status == metav1.ConditionTrue {
+		r.Logger.InfoContext(ctx, "NodePool request in Provisioned state, name="+nodepool.Name)
+		return NodePoolFSMNoop
+	}
+
+	unprovisionedCondition := meta.FindStatusCondition(
+		nodepool.Status.Conditions,
+		string(utils.NodePoolConditionTypes.Unprovisioned))
+	if unprovisionedCondition != nil && unprovisionedCondition.Status == metav1.ConditionTrue {
+		r.Logger.InfoContext(ctx, "NodePool request in Unprovisioned state, name="+nodepool.Name)
+		return NodePoolFSMProcessing
+	}
+
+	updatingCondition := meta.FindStatusCondition(
+		nodepool.Status.Conditions,
+		string(utils.NodePoolConditionTypes.Updating))
+	if updatingCondition != nil && updatingCondition.Status == metav1.ConditionTrue {
+		r.Logger.InfoContext(ctx, "NodePool request in Updating state, name="+nodepool.Name)
+		return NodePoolFSMProcessing
+	}
+
+	return NodePoolFSMNoop
+}
+
+func (r *NodePoolReconciler) handleNodePoolCreate(
+	ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (ctrl.Result, error) {
+	// Update the condition
+	utils.SetStatusCondition(&nodepool.Status.Conditions,
+		utils.NodePoolConditionTypes.Unprovisioned,
+		utils.NodePoolConditionReasons.InProgress,
+		metav1.ConditionTrue,
+		"Handling creation")
+
+	if updateErr := utils.UpdateK8sCRStatus(ctx, r.Client, nodepool); updateErr != nil {
+		return requeueWithMediumInterval(),
+			fmt.Errorf("failed to update status for NodePool %s: %w", nodepool.Name, updateErr)
+	}
+
+	if err := r.hwmgr.CreateNodePool(ctx, nodepool); err != nil {
+		return doNotRequeue(), fmt.Errorf("failed CreateNodePool: %w", err)
+	}
+
+	return doNotRequeue(), nil
+}
+
+func (r *NodePoolReconciler) handleNodePoolProcessing(
+	ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (ctrl.Result, error) {
+	if err := r.hwmgr.CheckNodePoolProgress(ctx, nodepool); err != nil {
+		return doNotRequeue(), fmt.Errorf("failed CheckNodePoolProgress: %w", err)
+	}
+
+	provisionedCondition := meta.FindStatusCondition(
+		nodepool.Status.Conditions,
+		string(utils.NodePoolConditionTypes.Provisioned))
+	if provisionedCondition != nil && provisionedCondition.Status == metav1.ConditionTrue {
+		r.Logger.InfoContext(ctx, "NodePool request in Provisioned state, name="+nodepool.Name)
+		return doNotRequeue(), nil
+	}
+
+	r.Logger.InfoContext(ctx, "NodePool request in progress, name="+nodepool.Name)
+
+	return requeueWithShortInterval(), nil
+}
+
+func (r *NodePoolReconciler) handleNodePoolObject(
+	ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (result ctrl.Result, err error) {
+	result = doNotRequeue()
+
+	switch r.determineAction(ctx, nodepool) {
+	case NodePoolFSMCreate:
+		return r.handleNodePoolCreate(ctx, nodepool)
+	case NodePoolFSMProcessing:
+		return r.handleNodePoolProcessing(ctx, nodepool)
+	case NodePoolFSMNoop:
+		// Nothing to do
+		return
+	}
+
+	return
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	ctx := context.TODO()
+
+	if hwmgr, err := service.NewHwMgrService().
+		SetClient(mgr.GetClient()).
+		SetLogger(r.Logger).
+		Build(ctx); err != nil {
+		return fmt.Errorf("failed to create HwMgrService: %w", err)
+	} else {
+		r.hwmgr = hwmgr
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&hwmgmtv1alpha1.NodePool{}).
 		Complete(r)
