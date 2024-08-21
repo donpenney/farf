@@ -2,16 +2,22 @@ package utils
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"reflect"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/yaml"
 )
+
+var utilsLog = ctrl.Log.WithName("oranUtilsLog")
 
 // Resource operations
 const (
@@ -101,21 +107,52 @@ func CreateK8sCR(ctx context.Context, c client.Client,
 }
 
 func DoesK8SResourceExist(ctx context.Context, c client.Client,
-	logger *slog.Logger,
 	name, namespace string, obj client.Object) (resourceExists bool, err error) {
 	err = c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, obj)
 
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("[doesK8SResourceExist] Resource not found, create it. ",
+			utilsLog.Info("[doesK8SResourceExist] Resource not found, create it. ",
 				"name", name, "namespace", namespace)
 			return false, nil
 		} else {
 			return false, err
 		}
 	} else {
-		logger.Info("[doesK8SResourceExist] Resource already present, return. ",
+		utilsLog.Info("[doesK8SResourceExist] Resource already present, return. ",
 			"name", name, "namespace", namespace)
 		return true, nil
 	}
+}
+
+func GetConfigmap(ctx context.Context, c client.Client, name, namespace string) (*corev1.ConfigMap, error) {
+	existingConfigmap := &corev1.ConfigMap{}
+	cmExists, err := DoesK8SResourceExist(
+		ctx, c, name, namespace, existingConfigmap)
+	if err != nil {
+		return nil, err
+	}
+
+	if !cmExists {
+		// Check if the configmap is missing
+		return nil, fmt.Errorf(
+			"the ConfigMap %s is not found in the namespace %s", name, namespace)
+	}
+	return existingConfigmap, nil
+}
+
+func ExtractDataFromConfigMap[T any](cm *corev1.ConfigMap, key string) (T, error) {
+	var object T
+
+	data, exists := cm.Data[key]
+	if !exists {
+		return object, fmt.Errorf("unable to find %s data in configmap", key)
+	}
+
+	err := yaml.Unmarshal([]byte(data), &object)
+	if err != nil {
+		return object, fmt.Errorf("unable to parse %s from configmap", key)
+	}
+
+	return object, nil
 }

@@ -74,6 +74,7 @@ func requeueWithCustomInterval(interval time.Duration) ctrl.Result {
 //+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodes,verbs=get;create;list;watch;update;patch;delete
 //+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodes/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=hardwaremanagement.oran.openshift.io,resources=nodes/finalizers,verbs=update
+//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;create;update;patch;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -161,20 +162,25 @@ func (r *NodePoolReconciler) determineAction(ctx context.Context, nodepool *hwmg
 
 func (r *NodePoolReconciler) handleNodePoolCreate(
 	ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (ctrl.Result, error) {
-	// Update the condition
-	utils.SetStatusCondition(&nodepool.Status.Conditions,
-		utils.NodePoolConditionTypes.Unprovisioned,
-		utils.NodePoolConditionReasons.InProgress,
-		metav1.ConditionTrue,
-		"Handling creation")
+	if err := r.hwmgr.CreateNodePool(ctx, nodepool); err != nil {
+		r.Logger.Error("failed createNodePool", "err", err)
+		utils.SetStatusCondition(&nodepool.Status.Conditions,
+			utils.NodePoolConditionTypes.Failed,
+			utils.NodePoolConditionReasons.Failed,
+			metav1.ConditionTrue,
+			"Creation request failed: "+err.Error())
+	} else {
+		// Update the condition
+		utils.SetStatusCondition(&nodepool.Status.Conditions,
+			utils.NodePoolConditionTypes.Unprovisioned,
+			utils.NodePoolConditionReasons.InProgress,
+			metav1.ConditionTrue,
+			"Handling creation")
+	}
 
 	if updateErr := utils.UpdateK8sCRStatus(ctx, r.Client, nodepool); updateErr != nil {
 		return requeueWithMediumInterval(),
 			fmt.Errorf("failed to update status for NodePool %s: %w", nodepool.Name, updateErr)
-	}
-
-	if err := r.hwmgr.CreateNodePool(ctx, nodepool); err != nil {
-		return doNotRequeue(), fmt.Errorf("failed CreateNodePool: %w", err)
 	}
 
 	return doNotRequeue(), nil
