@@ -28,12 +28,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/openshift-kni/generic-plugin/internal/controller/utils"
 	"github.com/openshift-kni/generic-plugin/internal/service"
 	hwmgmtv1alpha1 "github.com/openshift-kni/oran-o2ims/api/hardwaremanagement/v1alpha1"
 )
+
+const pluginFinalizer = "generic-plugin.oran.openshift.io/nodepool-finalizer"
 
 // NodePoolReconciler reconciles a NodePool object
 type NodePoolReconciler struct {
@@ -107,6 +110,28 @@ func (r *NodePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 	}
 
 	r.Logger.InfoContext(ctx, "[NodePool] "+nodepool.Name)
+
+	if nodepool.GetDeletionTimestamp() != nil {
+		if controllerutil.ContainsFinalizer(nodepool, pluginFinalizer) {
+			if err := r.finalizer(ctx, nodepool); err != nil {
+				return requeueWithError(fmt.Errorf("finalizer failed: %w", err))
+			}
+
+			controllerutil.RemoveFinalizer(nodepool, pluginFinalizer)
+			if err := r.Update(ctx, nodepool); err != nil {
+				return requeueWithError(fmt.Errorf("failed to update nodepool CR after removing finalizer: %w", err))
+			}
+
+			return
+		}
+	}
+
+	if !controllerutil.ContainsFinalizer(nodepool, pluginFinalizer) {
+		controllerutil.AddFinalizer(nodepool, pluginFinalizer)
+		if err := r.Update(ctx, nodepool); err != nil {
+			return requeueWithError(fmt.Errorf("failed to update nodepool CR after adding finalizer: %w", err))
+		}
+	}
 
 	return r.handleNodePoolObject(ctx, nodepool)
 }
@@ -188,21 +213,45 @@ func (r *NodePoolReconciler) handleNodePoolCreate(
 
 func (r *NodePoolReconciler) handleNodePoolProcessing(
 	ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (ctrl.Result, error) {
-	if err := r.hwmgr.CheckNodePoolProgress(ctx, nodepool); err != nil {
-		return doNotRequeue(), fmt.Errorf("failed CheckNodePoolProgress: %w", err)
+	full, err := r.hwmgr.CheckNodePoolProgress(ctx, nodepool)
+	if err != nil {
+		return requeueWithError(fmt.Errorf("failed CheckNodePoolProgress: %w", err))
 	}
 
-	provisionedCondition := meta.FindStatusCondition(
-		nodepool.Status.Conditions,
-		string(utils.NodePoolConditionTypes.Provisioned))
-	if provisionedCondition != nil && provisionedCondition.Status == metav1.ConditionTrue {
-		r.Logger.InfoContext(ctx, "NodePool request in Provisioned state, name="+nodepool.Name)
-		return doNotRequeue(), nil
+	allocatedNodes, err := r.hwmgr.GetAllocatedNodes(ctx, nodepool)
+	if err != nil {
+		return requeueWithError(fmt.Errorf("failed to get allocated nodes for %s: %w", nodepool.Name, err))
+	}
+	nodepool.Status.Properties.NodeNames = allocatedNodes
+
+	var result ctrl.Result
+
+	if full {
+		r.Logger.InfoContext(ctx, "NodePool request is fully allocated, name="+nodepool.Name)
+
+		utils.SetStatusCondition(&nodepool.Status.Conditions,
+			utils.NodePoolConditionTypes.Unprovisioned,
+			utils.NodePoolConditionReasons.Completed,
+			metav1.ConditionFalse,
+			"Finished creation")
+
+		utils.SetStatusCondition(&nodepool.Status.Conditions,
+			utils.NodePoolConditionTypes.Provisioned,
+			utils.NodePoolConditionReasons.Completed,
+			metav1.ConditionTrue,
+			"Created")
+
+		result = doNotRequeue()
+	} else {
+		r.Logger.InfoContext(ctx, "NodePool request in progress, name="+nodepool.Name)
+		result = requeueWithShortInterval()
 	}
 
-	r.Logger.InfoContext(ctx, "NodePool request in progress, name="+nodepool.Name)
+	if updateErr := utils.UpdateK8sCRStatus(ctx, r.Client, nodepool); updateErr != nil {
+		return requeueWithError(fmt.Errorf("failed to update status for NodePool %s: %w", nodepool.Name, updateErr))
+	}
 
-	return requeueWithShortInterval(), nil
+	return result, nil
 }
 
 func (r *NodePoolReconciler) handleNodePoolObject(
@@ -220,6 +269,16 @@ func (r *NodePoolReconciler) handleNodePoolObject(
 	}
 
 	return
+}
+
+func (r *NodePoolReconciler) finalizer(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) error {
+	r.Logger.InfoContext(ctx, "Finalizing nodepool", "name", nodepool.Name)
+
+	if err := r.hwmgr.ReleaseNodePool(ctx, nodepool); err != nil {
+		return fmt.Errorf("failed to release nodepool %s: %w", nodepool.Name, err)
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

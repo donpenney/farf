@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
+	"time"
 
 	"github.com/openshift-kni/generic-plugin/internal/controller/utils"
 	hwmgmtv1alpha1 "github.com/openshift-kni/oran-o2ims/api/hardwaremanagement/v1alpha1"
@@ -165,6 +167,9 @@ func (h *HwMgrService) CreateNodePool(ctx context.Context, nodepool *hwmgmtv1alp
 func (h *HwMgrService) AllocateNode(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) error {
 	cloudID := nodepool.Spec.CloudID
 
+	// Inject a delay before allocating node
+	time.Sleep(10 * time.Second)
+
 	cm, hwprof, allocated, err := h.GetCurrentResources(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to get current resources")
@@ -247,6 +252,26 @@ func (h *HwMgrService) CreateNode(ctx context.Context, cloudID, nodename, groupn
 	return nil
 }
 
+func (h *HwMgrService) DeleteNode(ctx context.Context, nodename string) error {
+
+	h.logger.InfoContext(ctx, "Deleting node:",
+		"nodename", nodename,
+	)
+
+	node := &hwmgmtv1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      nodename,
+			Namespace: h.namespace,
+		},
+	}
+
+	if err := h.Client.Delete(ctx, node); err != nil {
+		return fmt.Errorf("failed to delete Node: %w", err)
+	}
+
+	return nil
+}
+
 func (h *HwMgrService) IsNodeFullyAllocated(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (bool, error) {
 	cloudID := nodepool.Spec.CloudID
 
@@ -289,30 +314,45 @@ func (h *HwMgrService) IsNodeFullyAllocated(ctx context.Context, nodepool *hwmgm
 	return true, nil
 }
 
-func (h *HwMgrService) CheckNodePoolProgress(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) error {
+func (h *HwMgrService) GetAllocatedNodes(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (allocatedNodes []string, err error) {
 	cloudID := nodepool.Spec.CloudID
 
-	if full, err := h.IsNodeFullyAllocated(ctx, nodepool); err != nil {
-		return fmt.Errorf("failed to check nodepool allocation: %w", err)
-	} else if full {
-		// Node is fully allocated. Update pool status
-		utils.SetStatusCondition(&nodepool.Status.Conditions,
-			utils.NodePoolConditionTypes.Unprovisioned,
-			utils.NodePoolConditionReasons.Completed,
-			metav1.ConditionFalse,
-			"Finished creation")
+	_, _, allocated, err := h.GetCurrentResources(ctx)
+	if err != nil {
+		err = fmt.Errorf("unable to get current resources")
+		return
+	}
 
-		utils.SetStatusCondition(&nodepool.Status.Conditions,
-			utils.NodePoolConditionTypes.Provisioned,
-			utils.NodePoolConditionReasons.Completed,
-			metav1.ConditionTrue,
-			"Created")
-
-		if updateErr := utils.UpdateK8sCRStatus(ctx, h.Client, nodepool); updateErr != nil {
-			return fmt.Errorf("failed to update status for NodePool %s: %w", nodepool.Name, updateErr)
+	var cloud *allocatedCloud
+	for i, iter := range allocated.Clouds {
+		if iter.CloudID == cloudID {
+			cloud = &allocated.Clouds[i]
+			break
 		}
+	}
+	if cloud == nil {
+		// Cloud has not been allocated yet
+		return
+	}
 
-		return nil
+	// Get allocated resources
+	for _, nodegroup := range nodepool.Spec.NodeGroup {
+		allocatedNodes = append(allocatedNodes, cloud.Nodegroups[nodegroup.Name]...)
+	}
+
+	slices.Sort(allocatedNodes)
+	return
+}
+
+func (h *HwMgrService) CheckNodePoolProgress(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (full bool, err error) {
+	cloudID := nodepool.Spec.CloudID
+
+	if full, err = h.IsNodeFullyAllocated(ctx, nodepool); err != nil {
+		err = fmt.Errorf("failed to check nodepool allocation: %w", err)
+		return
+	} else if full {
+		// Node is fully allocated
+		return
 	}
 
 	for _, nodegroup := range nodepool.Spec.NodeGroup {
@@ -321,9 +361,58 @@ func (h *HwMgrService) CheckNodePoolProgress(ctx context.Context, nodepool *hwmg
 			"nodegroup name", nodegroup.Name,
 		)
 
-		if err := h.AllocateNode(ctx, nodepool); err != nil {
-			return fmt.Errorf("failed to allocate node: %w", err)
+		if err = h.AllocateNode(ctx, nodepool); err != nil {
+			err = fmt.Errorf("failed to allocate node: %w", err)
+			return
 		}
+	}
+
+	return
+}
+
+func (h *HwMgrService) ReleaseNodePool(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) error {
+	cloudID := nodepool.Spec.CloudID
+
+	h.logger.InfoContext(ctx, "Processing ReleaseNodePool request:",
+		"cloudID", cloudID,
+	)
+
+	cm, _, allocated, err := h.GetCurrentResources(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to get current resources")
+	}
+
+	index := -1
+	for i, cloud := range allocated.Clouds {
+		if cloud.CloudID == cloudID {
+			index = i
+			break
+		}
+	}
+
+	if index == -1 {
+		h.logger.InfoContext(ctx, "no allocated nodes found", "cloudID", cloudID)
+		return nil
+	}
+
+	for groupname := range allocated.Clouds[index].Nodegroups {
+		for _, nodename := range allocated.Clouds[index].Nodegroups[groupname] {
+			if err := h.DeleteNode(ctx, nodename); err != nil {
+				return fmt.Errorf("failed to delete node %s: %w", nodename, err)
+			}
+		}
+	}
+
+	allocated.Clouds = slices.Delete[[]allocatedCloud](allocated.Clouds, index, index+1)
+
+	// Update the configmap
+	yamlString, err := yaml.Marshal(&allocated)
+	if err != nil {
+		return fmt.Errorf("unable to marshal allocated data: %w", err)
+	}
+	cm.Data[allocatedKey] = string(yamlString)
+	if err := h.Client.Update(ctx, cm); err != nil {
+		return fmt.Errorf("failed to update configmap: %w", err)
 	}
 
 	return nil
