@@ -150,35 +150,15 @@ func (r *NodePoolReconciler) determineAction(ctx context.Context, nodepool *hwmg
 		return NodePoolFSMCreate
 	}
 
-	failedCondition := meta.FindStatusCondition(
-		nodepool.Status.Conditions,
-		string(utils.NodePoolConditionTypes.Failed))
-	if failedCondition != nil && failedCondition.Status == metav1.ConditionTrue {
-		r.Logger.InfoContext(ctx, "NodePool request in Failed state, name="+nodepool.Name)
-		return NodePoolFSMNoop
-	}
-
 	provisionedCondition := meta.FindStatusCondition(
 		nodepool.Status.Conditions,
-		string(utils.NodePoolConditionTypes.Provisioned))
-	if provisionedCondition != nil && provisionedCondition.Status == metav1.ConditionTrue {
-		r.Logger.InfoContext(ctx, "NodePool request in Provisioned state, name="+nodepool.Name)
-		return NodePoolFSMNoop
-	}
+		string(hwmgmtv1alpha1.Provisioned))
+	if provisionedCondition != nil {
+		if provisionedCondition.Status == metav1.ConditionTrue {
+			r.Logger.InfoContext(ctx, "NodePool request in Provisioned state, name="+nodepool.Name)
+			return NodePoolFSMNoop
+		}
 
-	unprovisionedCondition := meta.FindStatusCondition(
-		nodepool.Status.Conditions,
-		string(utils.NodePoolConditionTypes.Unprovisioned))
-	if unprovisionedCondition != nil && unprovisionedCondition.Status == metav1.ConditionTrue {
-		r.Logger.InfoContext(ctx, "NodePool request in Unprovisioned state, name="+nodepool.Name)
-		return NodePoolFSMProcessing
-	}
-
-	updatingCondition := meta.FindStatusCondition(
-		nodepool.Status.Conditions,
-		string(utils.NodePoolConditionTypes.Updating))
-	if updatingCondition != nil && updatingCondition.Status == metav1.ConditionTrue {
-		r.Logger.InfoContext(ctx, "NodePool request in Updating state, name="+nodepool.Name)
 		return NodePoolFSMProcessing
 	}
 
@@ -190,16 +170,16 @@ func (r *NodePoolReconciler) handleNodePoolCreate(
 	if err := r.hwmgr.CreateNodePool(ctx, nodepool); err != nil {
 		r.Logger.Error("failed createNodePool", "err", err)
 		utils.SetStatusCondition(&nodepool.Status.Conditions,
-			utils.NodePoolConditionTypes.Failed,
-			utils.NodePoolConditionReasons.Failed,
-			metav1.ConditionTrue,
+			hwmgmtv1alpha1.Provisioned,
+			hwmgmtv1alpha1.Failed,
+			metav1.ConditionFalse,
 			"Creation request failed: "+err.Error())
 	} else {
 		// Update the condition
 		utils.SetStatusCondition(&nodepool.Status.Conditions,
-			utils.NodePoolConditionTypes.Unprovisioned,
-			utils.NodePoolConditionReasons.InProgress,
-			metav1.ConditionTrue,
+			hwmgmtv1alpha1.Provisioned,
+			hwmgmtv1alpha1.InProgress,
+			metav1.ConditionFalse,
 			"Handling creation")
 	}
 
@@ -230,14 +210,8 @@ func (r *NodePoolReconciler) handleNodePoolProcessing(
 		r.Logger.InfoContext(ctx, "NodePool request is fully allocated, name="+nodepool.Name)
 
 		utils.SetStatusCondition(&nodepool.Status.Conditions,
-			utils.NodePoolConditionTypes.Unprovisioned,
-			utils.NodePoolConditionReasons.Completed,
-			metav1.ConditionFalse,
-			"Finished creation")
-
-		utils.SetStatusCondition(&nodepool.Status.Conditions,
-			utils.NodePoolConditionTypes.Provisioned,
-			utils.NodePoolConditionReasons.Completed,
+			hwmgmtv1alpha1.Provisioned,
+			hwmgmtv1alpha1.Completed,
 			metav1.ConditionTrue,
 			"Created")
 

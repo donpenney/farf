@@ -1,42 +1,13 @@
 package utils
 
 import (
+	hwmgmtv1alpha1 "github.com/openshift-kni/oran-o2ims/api/hardwaremanagement/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ConditionType is a string representing the condition's type
-type ConditionType string
-
-// The following constants define the different types of conditions that will be set for NodePools
-var NodePoolConditionTypes = struct {
-	Provisioned   ConditionType
-	Unprovisioned ConditionType
-	Updating      ConditionType
-	Failed        ConditionType
-}{
-	Provisioned:   "Provisioned",
-	Unprovisioned: "Unprovisioned",
-	Updating:      "Updating",
-	Failed:        "Failed",
-}
-
-// ConditionReason is a string representing the condition's reason
-type ConditionReason string
-
-// The following constants define the different reasons that conditions will be set for ClusterTemplate
-var NodePoolConditionReasons = struct {
-	Completed  ConditionReason
-	InProgress ConditionReason
-	Failed     ConditionReason
-}{
-	Completed:  "Completed",
-	InProgress: "InProgress",
-	Failed:     "Failed",
-}
-
 // SetStatusCondition is a convenience wrapper for meta.SetStatusCondition that takes in the types defined here and converts them to strings
-func SetStatusCondition(existingConditions *[]metav1.Condition, conditionType ConditionType, conditionReason ConditionReason, conditionStatus metav1.ConditionStatus, message string) {
+func SetStatusCondition(existingConditions *[]metav1.Condition, conditionType hwmgmtv1alpha1.ConditionType, conditionReason hwmgmtv1alpha1.ConditionReason, conditionStatus metav1.ConditionStatus, message string) {
 	conditions := *existingConditions
 	condition := meta.FindStatusCondition(*existingConditions, string(conditionType))
 	if condition != nil &&
