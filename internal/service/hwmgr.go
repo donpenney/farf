@@ -13,37 +13,41 @@ import (
 	hwmgmtv1alpha1 "github.com/openshift-kni/oran-o2ims/api/hardwaremanagement/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 )
 
-type hwProfile struct {
-	Name  string   `json:"name" yaml:"name"`
-	Nodes []string `json:"nodes" yaml:"nodes"`
+type cmNodeInfo struct {
+	HwProfile      string              `json:"hwprofile" yaml:"hwprofile"`
+	BMC            *hwmgmtv1alpha1.BMC `json:"bmc,omitempty"`
+	BootMACAddress string              `json:"bootMACAddress,omitempty"`
+	Hostname       string              `json:"hostname,omitempty"`
 }
 
-type cmHwProfile struct {
-	Profiles []hwProfile `json:"profiles" yaml:"profiles"`
+type cmResources struct {
+	HwProfiles []string              `json:"hwprofiles" yaml:"hwprofiles"`
+	Nodes      map[string]cmNodeInfo `json:"nodes" yaml:"nodes"`
 }
 
-type allocatedCloud struct {
+type cmAllocatedCloud struct {
 	CloudID    string              `json:"cloudID" yaml:"cloudID"`
 	Nodegroups map[string][]string `json:"nodegroups" yaml:"nodegroups"`
 }
 
-type cmAllocatedNodes struct {
-	Clouds []allocatedCloud `json:"clouds" yaml:"clouds"`
+type cmAllocations struct {
+	Clouds []cmAllocatedCloud `json:"clouds" yaml:"clouds"`
 }
 
 const (
-	hwprofilesKey = "hwprofiles"
-	allocatedKey  = "allocated"
-	cmName        = "nodelist"
+	resourcesKey   = "resources"
+	allocationsKey = "allocations"
+	cmName         = "nodelist"
 )
 
-func getFreeNodesInProfile(hwprof cmHwProfile, allocated cmAllocatedNodes, profname string) (freenodes []string) {
+func getFreeNodesInProfile(resources cmResources, allocations cmAllocations, profname string) (freenodes []string) {
 	inuse := make(map[string]bool)
-	for _, cloud := range allocated.Clouds {
+	for _, cloud := range allocations.Clouds {
 		for groupname := range cloud.Nodegroups {
 			for _, nodename := range cloud.Nodegroups[groupname] {
 				inuse[nodename] = true
@@ -51,15 +55,13 @@ func getFreeNodesInProfile(hwprof cmHwProfile, allocated cmAllocatedNodes, profn
 		}
 	}
 
-	for _, profile := range hwprof.Profiles {
-		if profile.Name != profname {
+	for nodename, node := range resources.Nodes {
+		if node.HwProfile != profname {
 			continue
 		}
 
-		for _, nodename := range profile.Nodes {
-			if _, used := inuse[nodename]; !used {
-				freenodes = append(freenodes, nodename)
-			}
+		if _, used := inuse[nodename]; !used {
+			freenodes = append(freenodes, nodename)
 		}
 	}
 
@@ -119,23 +121,23 @@ func (b *HwMgrServiceBuilder) Build(ctx context.Context) (
 }
 
 func (h *HwMgrService) GetCurrentResources(ctx context.Context) (
-	cm *corev1.ConfigMap, hwprof cmHwProfile, allocated cmAllocatedNodes, err error) {
+	cm *corev1.ConfigMap, resources cmResources, allocations cmAllocations, err error) {
 	cm, err = utils.GetConfigmap(ctx, h.Client, cmName, h.namespace)
 	if err != nil {
 		err = fmt.Errorf("unable to get configmap: %w", err)
 		return
 	}
 
-	hwprof, err = utils.ExtractDataFromConfigMap[cmHwProfile](cm, hwprofilesKey)
+	resources, err = utils.ExtractDataFromConfigMap[cmResources](cm, resourcesKey)
 	if err != nil {
-		err = fmt.Errorf("unable to parse hwprofiles from configmap: %w", err)
+		err = fmt.Errorf("unable to parse resources from configmap: %w", err)
 		return
 	}
 
-	allocated, err = utils.ExtractDataFromConfigMap[cmAllocatedNodes](cm, allocatedKey)
+	allocations, err = utils.ExtractDataFromConfigMap[cmAllocations](cm, allocationsKey)
 	if err != nil {
 		// Allocated node field may not be present
-		h.logger.InfoContext(ctx, "unable to parse allocated node info from configmap")
+		h.logger.InfoContext(ctx, "unable to parse allocations from configmap")
 		err = nil
 	}
 
@@ -149,13 +151,13 @@ func (h *HwMgrService) CreateNodePool(ctx context.Context, nodepool *hwmgmtv1alp
 		"cloudID", cloudID,
 	)
 
-	_, hwprof, allocated, err := h.GetCurrentResources(ctx)
+	_, resources, allocations, err := h.GetCurrentResources(ctx)
 	if err != nil {
-		return fmt.Errorf("unable to get current resources")
+		return fmt.Errorf("unable to get current resources: %w", err)
 	}
 
 	for _, nodegroup := range nodepool.Spec.NodeGroup {
-		freenodes := getFreeNodesInProfile(hwprof, allocated, nodegroup.HwProfile)
+		freenodes := getFreeNodesInProfile(resources, allocations, nodegroup.HwProfile)
 		if nodegroup.Size > len(freenodes) {
 			return fmt.Errorf("not enough free resources in group %s: freenodes=%d", nodegroup.HwProfile, len(freenodes))
 		}
@@ -170,22 +172,22 @@ func (h *HwMgrService) AllocateNode(ctx context.Context, nodepool *hwmgmtv1alpha
 	// Inject a delay before allocating node
 	time.Sleep(10 * time.Second)
 
-	cm, hwprof, allocated, err := h.GetCurrentResources(ctx)
+	cm, resources, allocations, err := h.GetCurrentResources(ctx)
 	if err != nil {
-		return fmt.Errorf("unable to get current resources")
+		return fmt.Errorf("unable to get current resources: %w", err)
 	}
 
-	var cloud *allocatedCloud
-	for i, iter := range allocated.Clouds {
+	var cloud *cmAllocatedCloud
+	for i, iter := range allocations.Clouds {
 		if iter.CloudID == cloudID {
-			cloud = &allocated.Clouds[i]
+			cloud = &allocations.Clouds[i]
 			break
 		}
 	}
 	if cloud == nil {
 		// The cloud wasn't found in the list, so create a new entry
-		allocated.Clouds = append(allocated.Clouds, allocatedCloud{CloudID: cloudID, Nodegroups: make(map[string][]string)})
-		cloud = &allocated.Clouds[len(allocated.Clouds)-1]
+		allocations.Clouds = append(allocations.Clouds, cmAllocatedCloud{CloudID: cloudID, Nodegroups: make(map[string][]string)})
+		cloud = &allocations.Clouds[len(allocations.Clouds)-1]
 	}
 
 	// Check available resources
@@ -198,27 +200,37 @@ func (h *HwMgrService) AllocateNode(ctx context.Context, nodepool *hwmgmtv1alpha
 			continue
 		}
 
-		freenodes := getFreeNodesInProfile(hwprof, allocated, nodegroup.HwProfile)
+		freenodes := getFreeNodesInProfile(resources, allocations, nodegroup.HwProfile)
 		if remaining > len(freenodes) {
 			return fmt.Errorf("not enough free resources remaining in group %s", nodegroup.HwProfile)
 		}
 
 		// Grab the first node
 		nodename := freenodes[0]
+
+		nodeinfo, exists := resources.Nodes[nodename]
+		if !exists {
+			return fmt.Errorf("unable to find nodeinfo for %s", nodename)
+		}
+
 		cloud.Nodegroups[nodegroup.Name] = append(cloud.Nodegroups[nodegroup.Name], nodename)
 
 		// Update the configmap
-		yamlString, err := yaml.Marshal(&allocated)
+		yamlString, err := yaml.Marshal(&allocations)
 		if err != nil {
 			return fmt.Errorf("unable to marshal allocated data: %w", err)
 		}
-		cm.Data[allocatedKey] = string(yamlString)
+		cm.Data[allocationsKey] = string(yamlString)
 		if err := h.Client.Update(ctx, cm); err != nil {
 			return fmt.Errorf("failed to update configmap: %w", err)
 		}
 
 		if err := h.CreateNode(ctx, cloudID, nodename, nodegroup.Name, nodegroup.HwProfile); err != nil {
-			return fmt.Errorf("failed to create allocated node: %w", err)
+			return fmt.Errorf("failed to create allocated node (%s): %w", nodename, err)
+		}
+
+		if err := h.UpdateNodeStatus(ctx, nodename, nodeinfo); err != nil {
+			return fmt.Errorf("failed to update node status (%s): %w", nodename, err)
 		}
 	}
 
@@ -252,6 +264,36 @@ func (h *HwMgrService) CreateNode(ctx context.Context, cloudID, nodename, groupn
 	return nil
 }
 
+func (h *HwMgrService) UpdateNodeStatus(ctx context.Context, nodename string, info cmNodeInfo) error {
+
+	h.logger.InfoContext(ctx, "Updating node:",
+		"nodename", nodename,
+	)
+
+	node := &hwmgmtv1alpha1.Node{}
+
+	if err := h.Client.Get(ctx, types.NamespacedName{Name: nodename, Namespace: h.namespace}, node); err != nil {
+		return fmt.Errorf("failed to create Node: %w", err)
+	}
+
+	h.logger.InfoContext(ctx, "Adding info to node", "nodename", nodename, "info", info)
+	node.Status.BMC = info.BMC
+	node.Status.BootMACAddress = info.BootMACAddress
+	node.Status.Hostname = info.Hostname
+
+	utils.SetStatusCondition(&node.Status.Conditions,
+		hwmgmtv1alpha1.Provisioned,
+		hwmgmtv1alpha1.Completed,
+		metav1.ConditionTrue,
+		"Provisioned")
+
+	if err := utils.UpdateK8sCRStatus(ctx, h.Client, node); err != nil {
+		return fmt.Errorf("failed to update status for node %s: %w", nodename, err)
+	}
+
+	return nil
+}
+
 func (h *HwMgrService) DeleteNode(ctx context.Context, nodename string) error {
 
 	h.logger.InfoContext(ctx, "Deleting node:",
@@ -275,15 +317,15 @@ func (h *HwMgrService) DeleteNode(ctx context.Context, nodename string) error {
 func (h *HwMgrService) IsNodeFullyAllocated(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (bool, error) {
 	cloudID := nodepool.Spec.CloudID
 
-	_, hwprof, allocated, err := h.GetCurrentResources(ctx)
+	_, resources, allocations, err := h.GetCurrentResources(ctx)
 	if err != nil {
-		return false, fmt.Errorf("unable to get current resources")
+		return false, fmt.Errorf("unable to get current resources: %w", err)
 	}
 
-	var cloud *allocatedCloud
-	for i, iter := range allocated.Clouds {
+	var cloud *cmAllocatedCloud
+	for i, iter := range allocations.Clouds {
 		if iter.CloudID == cloudID {
-			cloud = &allocated.Clouds[i]
+			cloud = &allocations.Clouds[i]
 			break
 		}
 	}
@@ -302,7 +344,7 @@ func (h *HwMgrService) IsNodeFullyAllocated(ctx context.Context, nodepool *hwmgm
 			continue
 		}
 
-		freenodes := getFreeNodesInProfile(hwprof, allocated, nodegroup.HwProfile)
+		freenodes := getFreeNodesInProfile(resources, allocations, nodegroup.HwProfile)
 		if remaining > len(freenodes) {
 			return false, fmt.Errorf("not enough free resources remaining in group %s", nodegroup.HwProfile)
 		}
@@ -317,16 +359,16 @@ func (h *HwMgrService) IsNodeFullyAllocated(ctx context.Context, nodepool *hwmgm
 func (h *HwMgrService) GetAllocatedNodes(ctx context.Context, nodepool *hwmgmtv1alpha1.NodePool) (allocatedNodes []string, err error) {
 	cloudID := nodepool.Spec.CloudID
 
-	_, _, allocated, err := h.GetCurrentResources(ctx)
+	_, _, allocations, err := h.GetCurrentResources(ctx)
 	if err != nil {
-		err = fmt.Errorf("unable to get current resources")
+		err = fmt.Errorf("unable to get current resources: %w", err)
 		return
 	}
 
-	var cloud *allocatedCloud
-	for i, iter := range allocated.Clouds {
+	var cloud *cmAllocatedCloud
+	for i, iter := range allocations.Clouds {
 		if iter.CloudID == cloudID {
-			cloud = &allocated.Clouds[i]
+			cloud = &allocations.Clouds[i]
 			break
 		}
 	}
@@ -377,13 +419,13 @@ func (h *HwMgrService) ReleaseNodePool(ctx context.Context, nodepool *hwmgmtv1al
 		"cloudID", cloudID,
 	)
 
-	cm, _, allocated, err := h.GetCurrentResources(ctx)
+	cm, _, allocations, err := h.GetCurrentResources(ctx)
 	if err != nil {
-		return fmt.Errorf("unable to get current resources")
+		return fmt.Errorf("unable to get current resources: %w", err)
 	}
 
 	index := -1
-	for i, cloud := range allocated.Clouds {
+	for i, cloud := range allocations.Clouds {
 		if cloud.CloudID == cloudID {
 			index = i
 			break
@@ -395,22 +437,22 @@ func (h *HwMgrService) ReleaseNodePool(ctx context.Context, nodepool *hwmgmtv1al
 		return nil
 	}
 
-	for groupname := range allocated.Clouds[index].Nodegroups {
-		for _, nodename := range allocated.Clouds[index].Nodegroups[groupname] {
+	for groupname := range allocations.Clouds[index].Nodegroups {
+		for _, nodename := range allocations.Clouds[index].Nodegroups[groupname] {
 			if err := h.DeleteNode(ctx, nodename); err != nil {
 				return fmt.Errorf("failed to delete node %s: %w", nodename, err)
 			}
 		}
 	}
 
-	allocated.Clouds = slices.Delete[[]allocatedCloud](allocated.Clouds, index, index+1)
+	allocations.Clouds = slices.Delete[[]cmAllocatedCloud](allocations.Clouds, index, index+1)
 
 	// Update the configmap
-	yamlString, err := yaml.Marshal(&allocated)
+	yamlString, err := yaml.Marshal(&allocations)
 	if err != nil {
 		return fmt.Errorf("unable to marshal allocated data: %w", err)
 	}
-	cm.Data[allocatedKey] = string(yamlString)
+	cm.Data[allocationsKey] = string(yamlString)
 	if err := h.Client.Update(ctx, cm); err != nil {
 		return fmt.Errorf("failed to update configmap: %w", err)
 	}
